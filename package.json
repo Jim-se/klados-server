@@ -14,6 +14,7 @@
   "dependencies": {
     "@google/genai": "^1.43.0",
     "@openrouter/sdk": "^0.9.11",
+    "@supabase/supabase-js": "^2.48.1",
     "axios": "^1.13.6",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
