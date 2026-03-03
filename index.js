@@ -11,9 +11,120 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 3001;
 
-// Middlewares
-app.use(cors());
+const xss = require('xss');
+const helmet = require('helmet');
+
+// Middlewares - Strict CORS Protection
+const allowedOrigins = [
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:3000'
+];
+
+if (process.env.FRONTEND_URL) {
+    allowedOrigins.push(process.env.FRONTEND_URL);
+}
+
+app.use(cors({
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like Postman or server-to-server)
+        if (!origin || allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            console.warn(`[CORS] Rejected request from unauthorized origin: ${origin}`);
+            callback(new Error('Blocked by CORS policy: Origin not allowed'));
+        }
+    },
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true, // Allow authorization headers to be sent
+    maxAge: 86400 // Cache preflight options for 24 hours
+}));
 app.use(express.json({ limit: '50mb' })); // Support base64 images
+
+// Content Security Policy (API constraints)
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'none'"],
+            scriptSrc: ["'none'"],
+        }
+    }
+}));
+
+// Recursive input sanitization to filter XSS on arrival
+const sanitizeBody = (obj) => {
+    if (typeof obj === 'string') {
+        return xss(obj);
+    }
+    if (Array.isArray(obj)) {
+        return obj.map(sanitizeBody);
+    }
+    if (typeof obj === 'object' && obj !== null) {
+        const sanitized = {};
+        for (const [key, value] of Object.entries(obj)) {
+            sanitized[key] = sanitizeBody(value);
+        }
+        return sanitized;
+    }
+    return obj;
+};
+
+app.use((req, res, next) => {
+    if (req.body) {
+        req.body = sanitizeBody(req.body);
+    }
+    next();
+});
+
+// --- Middleware to verify User Auth & Create Authenticated Client ---
+const { createClient } = require('@supabase/supabase-js');
+const authenticateUser = async (req, res, next) => {
+    const token = req.headers.authorization?.split(' ')[1];
+
+    if (!token) {
+        return res.status(401).json({ error: 'Unauthorized: No token provided' });
+    }
+
+    try {
+        const userClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+            global: { headers: { Authorization: `Bearer ${token}` } }
+        });
+
+        const { data: { user }, error } = await userClient.auth.getUser();
+
+        if (error || !user) {
+            return res.status(401).json({ error: 'Unauthorized: Invalid token' });
+        }
+
+        req.userClient = userClient;
+        req.user = user;
+        next();
+    } catch (err) {
+        console.error('[AUTH ERROR]:', err.message);
+        res.status(500).json({ error: 'Internal Auth Error' });
+    }
+};
+
+// --- LLM Security Middlewares ---
+const rateLimit = require('express-rate-limit');
+const llmRateLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 20, // 20 requests per minute
+    keyGenerator: (req) => req.user ? req.user.id : req.ip, // Limit per properly tracked user instead of shared IP
+    message: { error: 'Too many requests, please try again later.' }
+});
+
+const maxPayloadSize = (req, res, next) => {
+    // 5MB limit roughly (base64 images can be big, but prevent massive memory exhaustion)
+    if (req.body && JSON.stringify(req.body).length > 5000000) {
+        console.warn(`[SECURITY] Blocked oversized payload from User: ${req.user?.id || 'Unknown'}`);
+        return res.status(413).json({ error: 'Payload too large' });
+    }
+    next();
+};
+
+const llmSecurity = [authenticateUser, llmRateLimiter, maxPayloadSize];
 
 // --- Service Clients ---
 
@@ -32,7 +143,7 @@ const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 /**
  * OpenRouter Proxy with Streaming Support
  */
-app.post('/api/openrouter/chat', async (req, res) => {
+app.post('/api/openrouter/chat', llmSecurity, async (req, res) => {
     try {
         const { model, messages, stream } = req.body;
 
@@ -66,7 +177,7 @@ app.post('/api/openrouter/chat', async (req, res) => {
 /**
  * OpenAI Proxy
  */
-app.post('/api/openai/chat', async (req, res) => {
+app.post('/api/openai/chat', llmSecurity, async (req, res) => {
     try {
         const { model, messages } = req.body;
         const completion = await openaiClient.chat.completions.create({
@@ -83,7 +194,7 @@ app.post('/api/openai/chat', async (req, res) => {
 /**
  * Gemini Proxy
  */
-app.post('/api/gemini/generate', async (req, res) => {
+app.post('/api/gemini/generate', llmSecurity, async (req, res) => {
     try {
         const { model: modelName, prompt, history, files } = req.body;
         const response = await genAI.models.generateContent({
@@ -99,46 +210,6 @@ app.post('/api/gemini/generate', async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch from Gemini' });
     }
 });
-
-const { createClient } = require('@supabase/supabase-js');
-
-// --- Supabase Admin Client ---
-// On the server, we can use the Service Key (if you have it) 
-// or the Anon key. Using the server ensures the keys never reach the browser.
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-
-// --- Middleware to verify User Auth & Create Authenticated Client ---
-const authenticateUser = async (req, res, next) => {
-    const token = req.headers.authorization?.split(' ')[1];
-
-    if (!token) {
-        console.log('[AUTH] No token provided');
-        return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    try {
-        // Create an authenticated client for THIS specific request
-        const userClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
-            global: { headers: { Authorization: `Bearer ${token}` } }
-        });
-
-        // Verify the token is valid
-        const { data: { user }, error } = await userClient.auth.getUser();
-
-        if (error || !user) {
-            console.error('[AUTH] Token invalid:', error?.message);
-            return res.status(401).json({ error: 'Invalid token' });
-        }
-
-        // Attach the authenticated client and user to the request
-        req.userClient = userClient;
-        req.user = user;
-        next();
-    } catch (err) {
-        console.error('[AUTH] Auth system error:', err.message);
-        res.status(500).json({ error: 'Internal Auth Error' });
-    }
-};
 
 // --- Routes ---
 
