@@ -40,7 +40,6 @@ app.use(cors({
     credentials: true, // Allow authorization headers to be sent
     maxAge: 86400 // Cache preflight options for 24 hours
 }));
-app.use(express.json({ limit: '50mb' })); // Support base64 images
 
 // Content Security Policy (API constraints)
 app.use(helmet({
@@ -70,12 +69,29 @@ const sanitizeBody = (obj) => {
     return obj;
 };
 
-app.use((req, res, next) => {
+const sanitizeParsedBody = (req, res, next) => {
     if (req.body) {
         req.body = sanitizeBody(req.body);
     }
     next();
-});
+};
+
+const createContentLengthGuard = (maxBytes) => (req, res, next) => {
+    const headerValue = req.headers['content-length'];
+    const contentLength = Number(headerValue);
+
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+        return res.status(413).json({ error: 'Payload too large' });
+    }
+
+    next();
+};
+
+const createJsonBodyMiddleware = ({ limit, maxBytes }) => ([
+    createContentLengthGuard(maxBytes),
+    express.json({ limit }),
+    sanitizeParsedBody,
+]);
 
 // --- Middleware to verify User Auth & Create Authenticated Client ---
 const { createClient } = require('@supabase/supabase-js');
@@ -108,11 +124,20 @@ const authenticateUser = async (req, res, next) => {
 
 // --- LLM Security Middlewares ---
 const rateLimit = require('express-rate-limit');
+const requestRateLimitKey = (req) => req.user ? req.user.id : req.ip;
+
 const llmRateLimiter = rateLimit({
     windowMs: 60 * 1000, // 1 minute
     max: 20, // 20 requests per minute
-    keyGenerator: (req) => req.user ? req.user.id : req.ip, // Limit per properly tracked user instead of shared IP
+    keyGenerator: requestRateLimitKey, // Limit per properly tracked user instead of shared IP
     message: { error: 'Too many requests, please try again later.' }
+});
+
+const dbWriteRateLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    keyGenerator: requestRateLimitKey,
+    message: { error: 'Too many write requests, please try again later.' }
 });
 
 const maxPayloadSize = (req, res, next) => {
@@ -124,7 +149,77 @@ const maxPayloadSize = (req, res, next) => {
     next();
 };
 
-const llmSecurity = [authenticateUser, llmRateLimiter, maxPayloadSize];
+const llmSecurity = [authenticateUser, llmRateLimiter];
+const dbWriteSecurity = [authenticateUser, dbWriteRateLimiter];
+
+const JSON_LIMITS = {
+    llm: { limit: '5mb', maxBytes: 5 * 1024 * 1024 },
+    message: { limit: '2mb', maxBytes: 2 * 1024 * 1024 },
+    bugReport: { limit: '256kb', maxBytes: 256 * 1024 },
+    small: { limit: '64kb', maxBytes: 64 * 1024 },
+};
+
+const llmJsonBody = createJsonBodyMiddleware(JSON_LIMITS.llm);
+const messageJsonBody = createJsonBodyMiddleware(JSON_LIMITS.message);
+const bugReportJsonBody = createJsonBodyMiddleware(JSON_LIMITS.bugReport);
+const smallJsonBody = createJsonBodyMiddleware(JSON_LIMITS.small);
+
+const parseModelAllowlist = (envValue, fallbackModels) => {
+    if (!envValue) {
+        return new Set(fallbackModels);
+    }
+
+    return new Set(
+        envValue
+            .split(',')
+            .map((value) => value.trim())
+            .filter(Boolean)
+    );
+};
+
+const PUBLIC_LAUNCH_OPENROUTER_MODELS = [
+    'arcee-ai/trinity-large-preview:free',
+    'google/gemini-3-flash',
+];
+const PUBLIC_LAUNCH_OPENAI_MODELS = [];
+const PUBLIC_LAUNCH_GEMINI_MODELS = ['gemini-1.5-flash'];
+
+const OPENROUTER_ALLOWED_MODELS = parseModelAllowlist(
+    process.env.OPENROUTER_ALLOWED_MODELS,
+    PUBLIC_LAUNCH_OPENROUTER_MODELS
+);
+const OPENAI_ALLOWED_MODELS = parseModelAllowlist(
+    process.env.OPENAI_ALLOWED_MODELS,
+    PUBLIC_LAUNCH_OPENAI_MODELS
+);
+const GEMINI_ALLOWED_MODELS = parseModelAllowlist(
+    process.env.GEMINI_ALLOWED_MODELS,
+    PUBLIC_LAUNCH_GEMINI_MODELS
+);
+const TRACKED_ALLOWED_MODELS = new Set([
+    ...OPENROUTER_ALLOWED_MODELS,
+    ...OPENAI_ALLOWED_MODELS,
+    ...GEMINI_ALLOWED_MODELS,
+]);
+
+const normalizeModelId = (value) => typeof value === 'string' ? value.trim() : '';
+
+const createModelAccessGuard = ({ allowedModels, bodyKey = 'model', defaultModel = '' }) => (
+    (req, res, next) => {
+        const requestedModel = normalizeModelId(req.body?.[bodyKey] || defaultModel);
+
+        if (!requestedModel) {
+            return res.status(400).json({ error: 'A model identifier is required.' });
+        }
+
+        if (!allowedModels.has(requestedModel)) {
+            return res.status(403).json({ error: 'Requested model is not enabled for the public launch.' });
+        }
+
+        req.allowedModel = requestedModel;
+        next();
+    }
+);
 
 // --- Service Clients ---
 
@@ -396,11 +491,19 @@ const recordUserAggregate = async (userClient, user, totalCost) => {
 /**
  * OpenRouter Proxy with Streaming Support
  */
-app.post('/api/openrouter/chat', llmSecurity, async (req, res) => {
+app.post(
+    '/api/openrouter/chat',
+    ...llmSecurity,
+    ...llmJsonBody,
+    maxPayloadSize,
+    createModelAccessGuard({ allowedModels: OPENROUTER_ALLOWED_MODELS }),
+    async (req, res) => {
     try {
-        const { stream = false, ...requestBody } = req.body;
+        const { stream = false, model: _ignoredModel, ...requestBody } = req.body;
+        const model = req.allowedModel;
 
         const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+            model,
             ...requestBody,
             stream,
         }, {
@@ -429,9 +532,16 @@ app.post('/api/openrouter/chat', llmSecurity, async (req, res) => {
 /**
  * OpenAI Proxy
  */
-app.post('/api/openai/chat', llmSecurity, async (req, res) => {
+app.post(
+    '/api/openai/chat',
+    ...llmSecurity,
+    ...llmJsonBody,
+    maxPayloadSize,
+    createModelAccessGuard({ allowedModels: OPENAI_ALLOWED_MODELS }),
+    async (req, res) => {
     try {
-        const { model, messages } = req.body;
+        const { messages } = req.body;
+        const model = req.allowedModel;
         const completion = await openaiClient.chat.completions.create({
             model,
             messages,
@@ -446,9 +556,16 @@ app.post('/api/openai/chat', llmSecurity, async (req, res) => {
 /**
  * Gemini Proxy
  */
-app.post('/api/gemini/generate', llmSecurity, async (req, res) => {
+app.post(
+    '/api/gemini/generate',
+    ...llmSecurity,
+    ...llmJsonBody,
+    maxPayloadSize,
+    createModelAccessGuard({ allowedModels: GEMINI_ALLOWED_MODELS, defaultModel: 'gemini-1.5-flash' }),
+    async (req, res) => {
     try {
-        const { model: modelName, prompt, history, files } = req.body;
+        const { prompt, history, files } = req.body;
+        const modelName = req.allowedModel;
         const response = await genAI.models.generateContent({
             model: modelName || "gemini-1.5-flash",
             contents: [
@@ -509,7 +626,7 @@ app.get('/api/db/conversations/:id', authenticateUser, async (req, res) => {
 /**
  * Database Proxy: Create Conversation
  */
-app.post('/api/db/conversations', authenticateUser, async (req, res) => {
+app.post('/api/db/conversations', ...dbWriteSecurity, ...smallJsonBody, async (req, res) => {
     try {
         const payload = { ...req.body, user_id: req.user.id };
         const { data, error } = await req.userClient.from('conversations').insert(payload).select().single();
@@ -523,7 +640,7 @@ app.post('/api/db/conversations', authenticateUser, async (req, res) => {
 /**
  * Database Proxy: Create Node
  */
-app.post('/api/db/nodes', authenticateUser, async (req, res) => {
+app.post('/api/db/nodes', ...dbWriteSecurity, ...smallJsonBody, async (req, res) => {
     try {
         const payload = { ...req.body, user_id: req.user.id };
         const { data, error } = await req.userClient.from('nodes').insert(payload).select().single();
@@ -537,7 +654,7 @@ app.post('/api/db/nodes', authenticateUser, async (req, res) => {
 /**
  * Database Proxy: Update Node Title
  */
-app.patch('/api/db/nodes/:id', authenticateUser, async (req, res) => {
+app.patch('/api/db/nodes/:id', ...dbWriteSecurity, ...smallJsonBody, async (req, res) => {
     try {
         const { id } = req.params;
         const { title } = req.body;
@@ -555,7 +672,7 @@ app.patch('/api/db/nodes/:id', authenticateUser, async (req, res) => {
 /**
  * Database Proxy: Create Message
  */
-app.post('/api/db/messages', authenticateUser, async (req, res) => {
+app.post('/api/db/messages', ...dbWriteSecurity, ...messageJsonBody, async (req, res) => {
     try {
         const payload = { ...req.body, user_id: req.user.id };
         const { data, error } = await req.userClient.from('messages').insert(payload).select().single();
@@ -569,16 +686,21 @@ app.post('/api/db/messages', authenticateUser, async (req, res) => {
 /**
  * Database Proxy: Save Completed Turn and Track Usage
  */
-app.post('/api/db/messages/complete-turn', authenticateUser, async (req, res) => {
+app.post(
+    '/api/db/messages/complete-turn',
+    ...dbWriteSecurity,
+    ...messageJsonBody,
+    createModelAccessGuard({ allowedModels: TRACKED_ALLOWED_MODELS }),
+    async (req, res) => {
     try {
         const {
             nodes_id,
-            model,
             input_tokens = 0,
             output_tokens = 0,
             user_message,
             model_message,
         } = req.body;
+        const model = req.allowedModel;
 
         if (
             !nodes_id ||
@@ -673,7 +795,7 @@ app.post('/api/db/messages/complete-turn', authenticateUser, async (req, res) =>
 /**
  * Database Proxy: Update Conversation State
  */
-app.patch('/api/db/conversations/:id', authenticateUser, async (req, res) => {
+app.patch('/api/db/conversations/:id', ...dbWriteSecurity, ...smallJsonBody, async (req, res) => {
     try {
         const { id } = req.params;
         const { error } = await req.userClient
@@ -690,7 +812,7 @@ app.patch('/api/db/conversations/:id', authenticateUser, async (req, res) => {
 /**
  * Database Proxy: Delete Conversation
  */
-app.delete('/api/db/conversations/:id', authenticateUser, async (req, res) => {
+app.delete('/api/db/conversations/:id', ...dbWriteSecurity, async (req, res) => {
     try {
         const { id } = req.params;
         const { error } = await req.userClient
@@ -707,7 +829,7 @@ app.delete('/api/db/conversations/:id', authenticateUser, async (req, res) => {
 /**
  * Database Proxy: Report Bug
  */
-app.post('/api/db/bugs', authenticateUser, async (req, res) => {
+app.post('/api/db/bugs', ...dbWriteSecurity, ...bugReportJsonBody, async (req, res) => {
     try {
         const payload = { ...req.body, user_id: req.user.id };
         const { data, error } = await req.userClient.from('bug_reports').insert(payload).select().single();
@@ -728,6 +850,18 @@ app.get('/api/config/supabase', (req, res) => {
         url: process.env.SUPABASE_URL,
         key: process.env.SUPABASE_KEY // This should be the ANON key
     });
+});
+
+app.use((err, req, res, next) => {
+    if (err?.type === 'entity.too.large') {
+        return res.status(413).json({ error: 'Payload too large' });
+    }
+
+    if (err instanceof SyntaxError && 'body' in err) {
+        return res.status(400).json({ error: 'Invalid JSON payload' });
+    }
+
+    next(err);
 });
 
 // Health check
