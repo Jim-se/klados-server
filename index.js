@@ -138,6 +138,259 @@ const openaiClient = new OpenAI({
 
 const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
+const USER_ACCOUNTING_COLUMNS = 'id, email, full_name, tier, billing_period_start, billing_period_end, total_requests, lifetime_cost, current_period_cost, created_at';
+const PROVIDER_ALIASES = {
+    'arcee-ai': 'arcee',
+};
+
+const toFiniteNumber = (value) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const toTokenCount = (value) => {
+    const parsed = Math.round(toFiniteNumber(value));
+    return parsed > 0 ? parsed : 0;
+};
+
+const roundCost = (value) => Number(toFiniteNumber(value).toFixed(8));
+
+const addOneMonth = (dateLike) => {
+    const baseDate = dateLike ? new Date(dateLike) : new Date();
+    const safeDate = Number.isNaN(baseDate.getTime()) ? new Date() : baseDate;
+    const nextDate = new Date(safeDate);
+    nextDate.setMonth(nextDate.getMonth() + 1);
+    return nextDate;
+};
+
+const deriveProviderFromModel = (model) => {
+    if (typeof model !== 'string' || !model) {
+        return 'unknown';
+    }
+
+    const [prefix] = model.split('/');
+    return PROVIDER_ALIASES[prefix] || prefix || 'unknown';
+};
+
+const buildBillingWindow = (createdAt) => {
+    const start = createdAt ? new Date(createdAt) : new Date();
+    const safeStart = Number.isNaN(start.getTime()) ? new Date() : start;
+    return {
+        start: safeStart,
+        end: addOneMonth(safeStart),
+    };
+};
+
+const advanceBillingWindow = (startLike, endLike, now = new Date()) => {
+    let start = startLike ? new Date(startLike) : new Date(now);
+    let end = endLike ? new Date(endLike) : addOneMonth(start);
+
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) {
+        return {
+            start: new Date(now),
+            end: addOneMonth(now),
+            reset: true,
+        };
+    }
+
+    let reset = false;
+    while (end <= now) {
+        start = new Date(end);
+        end = addOneMonth(start);
+        reset = true;
+    }
+
+    return { start, end, reset };
+};
+
+const ensureUserAccountingRow = async (userClient, user) => {
+    const { data: existingUser, error } = await userClient
+        .from('users')
+        .select(USER_ACCOUNTING_COLUMNS)
+        .eq('id', user.id)
+        .maybeSingle();
+
+    if (error && error.code !== 'PGRST116') {
+        throw error;
+    }
+
+    const defaultWindow = buildBillingWindow(existingUser?.created_at || user.created_at);
+
+    if (!existingUser) {
+        const { data: insertedUser, error: insertError } = await userClient
+            .from('users')
+            .upsert({
+                id: user.id,
+                email: user.email ?? null,
+                full_name: user.user_metadata?.full_name ?? null,
+                tier: 'FREE',
+                billing_period_start: defaultWindow.start.toISOString(),
+                billing_period_end: defaultWindow.end.toISOString(),
+                total_requests: 0,
+                lifetime_cost: 0,
+                current_period_cost: 0,
+            })
+            .select(USER_ACCOUNTING_COLUMNS)
+            .single();
+
+        if (insertError) {
+            throw insertError;
+        }
+
+        return insertedUser;
+    }
+
+    const updates = {};
+
+    if (user.email && existingUser.email !== user.email) {
+        updates.email = user.email;
+    }
+
+    if (!existingUser.full_name && user.user_metadata?.full_name) {
+        updates.full_name = user.user_metadata.full_name;
+    }
+
+    if (existingUser.tier !== 'FREE') {
+        updates.tier = 'FREE';
+    }
+
+    if (!existingUser.billing_period_start) {
+        updates.billing_period_start = defaultWindow.start.toISOString();
+    }
+
+    if (!existingUser.billing_period_end) {
+        updates.billing_period_end = defaultWindow.end.toISOString();
+    }
+
+    if (existingUser.total_requests == null) {
+        updates.total_requests = 0;
+    }
+
+    if (existingUser.lifetime_cost == null) {
+        updates.lifetime_cost = 0;
+    }
+
+    if (existingUser.current_period_cost == null) {
+        updates.current_period_cost = 0;
+    }
+
+    if (Object.keys(updates).length === 0) {
+        return existingUser;
+    }
+
+    const { data: updatedUser, error: updateError } = await userClient
+        .from('users')
+        .update(updates)
+        .eq('id', user.id)
+        .select(USER_ACCOUNTING_COLUMNS)
+        .single();
+
+    if (updateError) {
+        throw updateError;
+    }
+
+    return updatedUser;
+};
+
+const resolvePricingForModel = async (userClient, model) => {
+    const { data: priceRow, error } = await userClient
+        .from('prices')
+        .select('provider, input_price_per_million, output_price_per_million')
+        .eq('model', model)
+        .maybeSingle();
+
+    if (error && error.code !== 'PGRST116') {
+        throw error;
+    }
+
+    if (!priceRow) {
+        console.warn(`[USAGE] No price row found for model "${model}". Defaulting cost to 0.`);
+    }
+
+    return {
+        provider: priceRow?.provider || deriveProviderFromModel(model),
+        inputPricePerMillion: toFiniteNumber(priceRow?.input_price_per_million),
+        outputPricePerMillion: toFiniteNumber(priceRow?.output_price_per_million),
+    };
+};
+
+const recordUsageAggregate = async (userClient, { userId, model, provider, inputTokens, outputTokens, totalCost }) => {
+    const usageDate = new Date().toISOString().slice(0, 10);
+    const { data: existingUsage, error } = await userClient
+        .from('usage')
+        .select('id, total_input_tokens, total_output_tokens, total_cost')
+        .eq('user_id', userId)
+        .eq('model', model)
+        .eq('provider', provider)
+        .maybeSingle();
+
+    if (error && error.code !== 'PGRST116') {
+        throw error;
+    }
+
+    if (!existingUsage) {
+        const { error: insertError } = await userClient.from('usage').insert({
+            date: usageDate,
+            user_id: userId,
+            provider,
+            model,
+            total_input_tokens: inputTokens,
+            total_output_tokens: outputTokens,
+            total_cost: totalCost,
+        });
+
+        if (insertError) {
+            throw insertError;
+        }
+
+        return;
+    }
+
+    const { error: updateError } = await userClient
+        .from('usage')
+        .update({
+            total_input_tokens: toTokenCount(existingUsage.total_input_tokens) + inputTokens,
+            total_output_tokens: toTokenCount(existingUsage.total_output_tokens) + outputTokens,
+            total_cost: roundCost(toFiniteNumber(existingUsage.total_cost) + totalCost),
+        })
+        .eq('id', existingUsage.id);
+
+    if (updateError) {
+        throw updateError;
+    }
+};
+
+const recordUserAggregate = async (userClient, user, totalCost) => {
+    const currentUser = await ensureUserAccountingRow(userClient, user);
+    const now = new Date();
+    const { start, end, reset } = advanceBillingWindow(
+        currentUser.billing_period_start || currentUser.created_at || user.created_at,
+        currentUser.billing_period_end,
+        now
+    );
+
+    const nextTotalRequests = toTokenCount(currentUser.total_requests) + 1;
+    const nextLifetimeCost = roundCost(toFiniteNumber(currentUser.lifetime_cost) + totalCost);
+    const currentPeriodBaseCost = reset ? 0 : toFiniteNumber(currentUser.current_period_cost);
+
+    const { error } = await userClient
+        .from('users')
+        .update({
+            tier: 'FREE',
+            total_requests: nextTotalRequests,
+            lifetime_cost: nextLifetimeCost,
+            current_period_cost: roundCost(currentPeriodBaseCost + totalCost),
+            billing_period_start: start.toISOString(),
+            billing_period_end: end.toISOString(),
+            updated_at: now.toISOString(),
+        })
+        .eq('id', user.id);
+
+    if (error) {
+        throw error;
+    }
+};
+
 // --- Routes ---
 
 /**
@@ -145,12 +398,11 @@ const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
  */
 app.post('/api/openrouter/chat', llmSecurity, async (req, res) => {
     try {
-        const { model, messages, stream } = req.body;
+        const { stream = false, ...requestBody } = req.body;
 
         const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
-            model,
-            messages,
-            stream: stream || false,
+            ...requestBody,
+            stream,
         }, {
             headers: {
                 'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
@@ -309,6 +561,110 @@ app.post('/api/db/messages', authenticateUser, async (req, res) => {
         const { data, error } = await req.userClient.from('messages').insert(payload).select().single();
         if (error) throw error;
         res.json(data);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+/**
+ * Database Proxy: Save Completed Turn and Track Usage
+ */
+app.post('/api/db/messages/complete-turn', authenticateUser, async (req, res) => {
+    try {
+        const {
+            nodes_id,
+            model,
+            input_tokens = 0,
+            output_tokens = 0,
+            user_message,
+            model_message,
+        } = req.body;
+
+        if (
+            !nodes_id ||
+            !model ||
+            !user_message ||
+            typeof user_message.content !== 'string' ||
+            typeof user_message.ordinal !== 'number' ||
+            !model_message ||
+            typeof model_message.content !== 'string' ||
+            typeof model_message.ordinal !== 'number'
+        ) {
+            return res.status(400).json({ error: 'Missing required completed-turn fields.' });
+        }
+
+        const inputTokens = toTokenCount(input_tokens);
+        const outputTokens = toTokenCount(output_tokens);
+        const pricing = await resolvePricingForModel(req.userClient, model);
+        const inputCost = roundCost((inputTokens / 1_000_000) * pricing.inputPricePerMillion);
+        const outputCost = roundCost((outputTokens / 1_000_000) * pricing.outputPricePerMillion);
+        const totalCost = roundCost(inputCost + outputCost);
+
+        const messagePayloads = [
+            {
+                nodes_id,
+                user_id: req.user.id,
+                role: 'user',
+                content: user_message.content,
+                ordinal: user_message.ordinal,
+                i_o_tokens: inputTokens,
+                cost: inputCost,
+                model,
+                provider: pricing.provider,
+            },
+            {
+                nodes_id,
+                user_id: req.user.id,
+                role: 'model',
+                content: model_message.content,
+                ordinal: model_message.ordinal,
+                i_o_tokens: outputTokens,
+                cost: outputCost,
+                model,
+                provider: pricing.provider,
+            }
+        ];
+
+        const { data: insertedMessages, error: insertError } = await req.userClient
+            .from('messages')
+            .insert(messagePayloads)
+            .select('*');
+
+        if (insertError) {
+            throw insertError;
+        }
+
+        let usageTracked = true;
+
+        try {
+            await recordUsageAggregate(req.userClient, {
+                userId: req.user.id,
+                model,
+                provider: pricing.provider,
+                inputTokens,
+                outputTokens,
+                totalCost,
+            });
+
+            await recordUserAggregate(req.userClient, req.user, totalCost);
+        } catch (usageError) {
+            usageTracked = false;
+            console.error('[USAGE] Failed to update aggregates:', usageError.message);
+        }
+
+        res.json({
+            messages: insertedMessages,
+            usage: {
+                provider: pricing.provider,
+                model,
+                input_tokens: inputTokens,
+                output_tokens: outputTokens,
+                input_cost: inputCost,
+                output_cost: outputCost,
+                total_cost: totalCost,
+                usage_tracked: usageTracked,
+            }
+        });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
