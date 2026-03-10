@@ -5,6 +5,7 @@ const { OpenRouter } = require('@openrouter/sdk');
 const { OpenAI } = require('openai');
 const { GoogleGenAI } = require('@google/genai');
 const axios = require('axios');
+const { PassThrough } = require('stream');
 
 dotenv.config();
 
@@ -345,7 +346,7 @@ const ensureUserAccountingRow = async (userClient, user) => {
         updates.full_name = user.user_metadata.full_name;
     }
 
-    if (existingUser.tier !== 'FREE') {
+    if (!existingUser.tier) {
         updates.tier = 'FREE';
     }
 
@@ -407,6 +408,116 @@ const resolvePricingForModel = async (userClient, model) => {
         inputPricePerMillion: toFiniteNumber(priceRow?.input_price_per_million),
         outputPricePerMillion: toFiniteNumber(priceRow?.output_price_per_million),
     };
+};
+
+const collectTextFragments = (value) => {
+    if (!value) return [];
+
+    if (typeof value === 'string') {
+        return value ? [value] : [];
+    }
+
+    if (Array.isArray(value)) {
+        return value.flatMap(collectTextFragments);
+    }
+
+    if (typeof value === 'object') {
+        if (typeof value.text === 'string') {
+            return value.text ? [value.text] : [];
+        }
+
+        if (typeof value.content === 'string') {
+            return value.content ? [value.content] : [];
+        }
+
+        if (Array.isArray(value.content)) {
+            return value.content.flatMap(collectTextFragments);
+        }
+
+        if (Array.isArray(value.parts)) {
+            return value.parts.flatMap(collectTextFragments);
+        }
+    }
+
+    return [];
+};
+
+const estimateTokensFromText = (text) => {
+    if (typeof text !== 'string' || !text) return 0;
+    // Conservative heuristic to avoid under-reserving.
+    return Math.ceil(text.length / 4);
+};
+
+const estimateInputTokensFromMessages = (messages) => {
+    if (!Array.isArray(messages)) return 0;
+    const text = messages
+        .flatMap((msg) => collectTextFragments(msg?.content))
+        .join(' ');
+    return estimateTokensFromText(text);
+};
+
+const extractUsageTokens = (payload) => {
+    const usage = payload?.usage;
+    if (!usage || typeof usage !== 'object') return null;
+
+    const inputTokens = toTokenCount(
+        usage.prompt_tokens ?? usage.input_tokens ?? usage.promptTokens ?? usage.inputTokens ?? usage.promptTokenCount
+    );
+    const outputTokens = toTokenCount(
+        usage.completion_tokens ??
+        usage.output_tokens ??
+        usage.completionTokens ??
+        usage.outputTokens ??
+        usage.candidatesTokenCount
+    );
+
+    if (!inputTokens && !outputTokens) {
+        return null;
+    }
+
+    return { inputTokens, outputTokens };
+};
+
+const reserveUsageEvent = async (userClient, { provider, model, reservedCost, reservedInputTokens, reservedOutputTokens }) => {
+    const { data, error } = await userClient
+        .rpc('usage_reserve_request', {
+            p_provider: provider,
+            p_model: model,
+            p_reserved_cost: reservedCost,
+            p_reserved_input_tokens: reservedInputTokens ?? null,
+            p_reserved_output_tokens: reservedOutputTokens ?? null,
+        })
+        .single();
+
+    if (error) {
+        throw error;
+    }
+
+    return data;
+};
+
+const finalizeUsageEvent = async (userClient, { usageEventId, cost, inputTokens, outputTokens }) => {
+    const { error } = await userClient.rpc('usage_finalize_request', {
+        p_usage_event_id: usageEventId,
+        p_cost: cost,
+        p_input_tokens: inputTokens ?? null,
+        p_output_tokens: outputTokens ?? null,
+    });
+
+    if (error) {
+        throw error;
+    }
+};
+
+const cancelUsageEvent = async (userClient, { usageEventId, errorMessage }) => {
+    const { error } = await userClient.rpc('usage_cancel_request', {
+        p_usage_event_id: usageEventId,
+        p_error: errorMessage ?? null,
+    });
+
+    if (error) {
+        throw error;
+    }
 };
 
 const recordUsageAggregate = async (userClient, { userId, model, provider, inputTokens, outputTokens, totalCost }) => {
@@ -498,9 +609,45 @@ app.post(
     maxPayloadSize,
     createModelAccessGuard({ allowedModels: OPENROUTER_ALLOWED_MODELS }),
     async (req, res) => {
+    let usageEventId = null;
     try {
         const { stream = false, model: _ignoredModel, ...requestBody } = req.body;
         const model = req.allowedModel;
+
+        const pricing = await resolvePricingForModel(req.userClient, model);
+        const inputTokenEstimate = estimateInputTokensFromMessages(requestBody.messages);
+        const outputTokenBudget = toTokenCount(
+            requestBody.max_tokens ?? requestBody.max_completion_tokens ?? requestBody.max_output_tokens ?? 1024
+        );
+        const reservedCost = roundCost(
+            (inputTokenEstimate / 1_000_000) * pricing.inputPricePerMillion +
+            (outputTokenBudget / 1_000_000) * pricing.outputPricePerMillion
+        );
+
+        const reservation = await reserveUsageEvent(req.userClient, {
+            provider: pricing.provider,
+            model,
+            reservedCost,
+            reservedInputTokens: inputTokenEstimate,
+            reservedOutputTokens: outputTokenBudget,
+        });
+
+        if (!reservation?.allowed) {
+            return res.status(402).json({
+                error: 'Usage limit exceeded',
+                reason: reservation?.reason ?? 'LIMIT',
+                four_hour: {
+                    spend: reservation?.four_hour_spend ?? null,
+                    limit: reservation?.four_hour_limit ?? null,
+                },
+                month: {
+                    spend: reservation?.monthly_spend ?? null,
+                    limit: reservation?.monthly_limit ?? null,
+                },
+            });
+        }
+
+        usageEventId = reservation?.usage_event_id;
 
         const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
             model,
@@ -519,11 +666,120 @@ app.post(
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
 
-            response.data.pipe(res);
+            const upstream = response.data;
+            const tee = new PassThrough();
+            let buffer = '';
+            let latestUsage = null;
+            let finalized = false;
+
+            const finalizeOnce = async ({ inputTokens, outputTokens, cost, errorMessage }) => {
+                if (!usageEventId || finalized) return;
+                finalized = true;
+
+                try {
+                    if (errorMessage) {
+                        await finalizeUsageEvent(req.userClient, {
+                            usageEventId,
+                            cost: reservedCost,
+                            inputTokens: inputTokens ?? inputTokenEstimate,
+                            outputTokens: outputTokens ?? outputTokenBudget,
+                        });
+                        return;
+                    }
+
+                    await finalizeUsageEvent(req.userClient, {
+                        usageEventId,
+                        cost,
+                        inputTokens,
+                        outputTokens,
+                    });
+                } catch (finalizeError) {
+                    console.error('[USAGE] Failed to finalize usage_event:', finalizeError.message);
+                }
+            };
+
+            tee.on('data', (chunk) => {
+                buffer += chunk.toString('utf8');
+                let newlineIndex;
+                while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+                    const line = buffer.slice(0, newlineIndex).trimEnd();
+                    buffer = buffer.slice(newlineIndex + 1);
+                    if (!line.startsWith('data:')) continue;
+
+                    const payloadText = line.slice('data:'.length).trim();
+                    if (!payloadText || payloadText === '[DONE]') continue;
+
+                    try {
+                        const payload = JSON.parse(payloadText);
+                        const usage = extractUsageTokens(payload);
+                        if (usage) {
+                            latestUsage = usage;
+                        }
+                    } catch {
+                        // ignore parse errors on non-JSON frames
+                    }
+                }
+            });
+
+            upstream.on('end', async () => {
+                const usage = latestUsage;
+                if (!usage) {
+                    await finalizeOnce({ errorMessage: 'missing_usage' });
+                    return;
+                }
+
+                const inputCost = roundCost((usage.inputTokens / 1_000_000) * pricing.inputPricePerMillion);
+                const outputCost = roundCost((usage.outputTokens / 1_000_000) * pricing.outputPricePerMillion);
+                const totalCost = roundCost(inputCost + outputCost);
+                await finalizeOnce({
+                    inputTokens: usage.inputTokens,
+                    outputTokens: usage.outputTokens,
+                    cost: totalCost,
+                });
+            });
+
+            upstream.on('error', async (err) => {
+                console.error('OpenRouter Stream Error:', err.message);
+                await finalizeOnce({ errorMessage: err.message });
+            });
+
+            res.on('close', async () => {
+                if (!upstream.destroyed) {
+                    upstream.destroy();
+                }
+                await finalizeOnce({ errorMessage: 'client_disconnected' });
+            });
+
+            upstream.pipe(tee);
+            tee.pipe(res);
         } else {
+            const usage = extractUsageTokens(response.data);
+            if (usageEventId) {
+                try {
+                    const inputCost = roundCost((toTokenCount(usage?.inputTokens) / 1_000_000) * pricing.inputPricePerMillion);
+                    const outputCost = roundCost((toTokenCount(usage?.outputTokens) / 1_000_000) * pricing.outputPricePerMillion);
+                    const totalCost = roundCost(inputCost + outputCost);
+
+                    await finalizeUsageEvent(req.userClient, {
+                        usageEventId,
+                        cost: usage ? totalCost : reservedCost,
+                        inputTokens: usage?.inputTokens ?? inputTokenEstimate,
+                        outputTokens: usage?.outputTokens ?? outputTokenBudget,
+                    });
+                } catch (finalizeError) {
+                    console.error('[USAGE] Failed to finalize usage_event:', finalizeError.message);
+                }
+            }
             res.json(response.data);
         }
     } catch (error) {
+        if (usageEventId) {
+            try {
+                await cancelUsageEvent(req.userClient, { usageEventId, errorMessage: error.message });
+            } catch (cancelError) {
+                console.error('[USAGE] Failed to cancel usage_event:', cancelError.message);
+            }
+        }
         console.error('OpenRouter Error:', error.response?.data || error.message);
         res.status(error.response?.status || 500).json({ error: 'Failed to fetch from OpenRouter' });
     }
@@ -539,15 +795,59 @@ app.post(
     maxPayloadSize,
     createModelAccessGuard({ allowedModels: OPENAI_ALLOWED_MODELS }),
     async (req, res) => {
+    let usageEventId = null;
     try {
-        const { messages } = req.body;
+        const { messages, max_tokens, max_completion_tokens } = req.body;
         const model = req.allowedModel;
+
+        const pricing = await resolvePricingForModel(req.userClient, model);
+        const inputTokenEstimate = estimateInputTokensFromMessages(messages);
+        const outputTokenBudget = toTokenCount(max_tokens ?? max_completion_tokens ?? 1024);
+        const reservedCost = roundCost(
+            (inputTokenEstimate / 1_000_000) * pricing.inputPricePerMillion +
+            (outputTokenBudget / 1_000_000) * pricing.outputPricePerMillion
+        );
+
+        const reservation = await reserveUsageEvent(req.userClient, {
+            provider: pricing.provider,
+            model,
+            reservedCost,
+            reservedInputTokens: inputTokenEstimate,
+            reservedOutputTokens: outputTokenBudget,
+        });
+
+        if (!reservation?.allowed) {
+            return res.status(402).json({ error: 'Usage limit exceeded', reason: reservation?.reason ?? 'LIMIT' });
+        }
+
+        usageEventId = reservation?.usage_event_id;
+
         const completion = await openaiClient.chat.completions.create({
             model,
             messages,
         });
+
+        const usage = extractUsageTokens(completion);
+        if (usageEventId) {
+            const inputCost = roundCost((toTokenCount(usage?.inputTokens) / 1_000_000) * pricing.inputPricePerMillion);
+            const outputCost = roundCost((toTokenCount(usage?.outputTokens) / 1_000_000) * pricing.outputPricePerMillion);
+            const totalCost = roundCost(inputCost + outputCost);
+            await finalizeUsageEvent(req.userClient, {
+                usageEventId,
+                cost: usage ? totalCost : reservedCost,
+                inputTokens: usage?.inputTokens ?? inputTokenEstimate,
+                outputTokens: usage?.outputTokens ?? outputTokenBudget,
+            });
+        }
         res.json(completion);
     } catch (error) {
+        if (usageEventId) {
+            try {
+                await cancelUsageEvent(req.userClient, { usageEventId, errorMessage: error.message });
+            } catch (cancelError) {
+                console.error('[USAGE] Failed to cancel usage_event:', cancelError.message);
+            }
+        }
         console.error('OpenAI Error:', error.message);
         res.status(500).json({ error: 'Failed to fetch from OpenAI' });
     }
@@ -563,9 +863,35 @@ app.post(
     maxPayloadSize,
     createModelAccessGuard({ allowedModels: GEMINI_ALLOWED_MODELS, defaultModel: 'gemini-1.5-flash' }),
     async (req, res) => {
+    let usageEventId = null;
     try {
         const { prompt, history, files } = req.body;
         const modelName = req.allowedModel;
+
+        const pricing = await resolvePricingForModel(req.userClient, modelName);
+        const inputTokenEstimate = estimateTokensFromText(
+            [...collectTextFragments(prompt), ...collectTextFragments(history)].join(' ')
+        );
+        const outputTokenBudget = 1024;
+        const reservedCost = roundCost(
+            (inputTokenEstimate / 1_000_000) * pricing.inputPricePerMillion +
+            (outputTokenBudget / 1_000_000) * pricing.outputPricePerMillion
+        );
+
+        const reservation = await reserveUsageEvent(req.userClient, {
+            provider: pricing.provider,
+            model: modelName,
+            reservedCost,
+            reservedInputTokens: inputTokenEstimate,
+            reservedOutputTokens: outputTokenBudget,
+        });
+
+        if (!reservation?.allowed) {
+            return res.status(402).json({ error: 'Usage limit exceeded', reason: reservation?.reason ?? 'LIMIT' });
+        }
+
+        usageEventId = reservation?.usage_event_id;
+
         const response = await genAI.models.generateContent({
             model: modelName || "gemini-1.5-flash",
             contents: [
@@ -573,8 +899,41 @@ app.post(
                 { role: 'user', parts: [{ text: prompt }] }
             ]
         });
+
+        if (usageEventId) {
+            try {
+                const usageMeta = response?.usageMetadata;
+                const metaUsage = usageMeta
+                    ? {
+                        inputTokens: toTokenCount(usageMeta.promptTokenCount),
+                        outputTokens: toTokenCount(usageMeta.candidatesTokenCount),
+                    }
+                    : null;
+
+                const inputCost = roundCost((toTokenCount(metaUsage?.inputTokens) / 1_000_000) * pricing.inputPricePerMillion);
+                const outputCost = roundCost((toTokenCount(metaUsage?.outputTokens) / 1_000_000) * pricing.outputPricePerMillion);
+                const totalCost = roundCost(inputCost + outputCost);
+
+                await finalizeUsageEvent(req.userClient, {
+                    usageEventId,
+                    cost: metaUsage ? totalCost : reservedCost,
+                    inputTokens: metaUsage?.inputTokens ?? inputTokenEstimate,
+                    outputTokens: metaUsage?.outputTokens ?? outputTokenBudget,
+                });
+            } catch (finalizeError) {
+                console.error('[USAGE] Failed to finalize usage_event:', finalizeError.message);
+            }
+        }
+
         res.json({ text: response.text });
     } catch (error) {
+        if (usageEventId) {
+            try {
+                await cancelUsageEvent(req.userClient, { usageEventId, errorMessage: error.message });
+            } catch (cancelError) {
+                console.error('[USAGE] Failed to cancel usage_event:', cancelError.message);
+            }
+        }
         console.error('Gemini Error:', error.message);
         res.status(500).json({ error: 'Failed to fetch from Gemini' });
     }
@@ -757,6 +1116,7 @@ app.post(
         }
 
         let usageTracked = true;
+        let caps = null;
 
         try {
             await recordUsageAggregate(req.userClient, {
@@ -774,6 +1134,16 @@ app.post(
             console.error('[USAGE] Failed to update aggregates:', usageError.message);
         }
 
+        try {
+            const { data: capRow, error: capError } = await req.userClient.rpc('usage_get_status').single();
+            if (capError) {
+                throw capError;
+            }
+            caps = capRow;
+        } catch (capErr) {
+            console.error('[USAGE] Failed to load cap status:', capErr.message);
+        }
+
         res.json({
             messages: insertedMessages,
             usage: {
@@ -785,7 +1155,8 @@ app.post(
                 output_cost: outputCost,
                 total_cost: totalCost,
                 usage_tracked: usageTracked,
-            }
+            },
+            caps,
         });
     } catch (error) {
         res.status(500).json({ error: error.message });
