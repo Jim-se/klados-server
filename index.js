@@ -165,43 +165,23 @@ const messageJsonBody = createJsonBodyMiddleware(JSON_LIMITS.message);
 const bugReportJsonBody = createJsonBodyMiddleware(JSON_LIMITS.bugReport);
 const smallJsonBody = createJsonBodyMiddleware(JSON_LIMITS.small);
 
-const parseModelAllowlist = (envValue, fallbackModels) => {
+const parseModelAllowlist = (envValue) => {
     if (!envValue) {
-        return new Set(fallbackModels);
+        return null;
     }
 
-    return new Set(
-        envValue
-            .split(',')
-            .map((value) => value.trim())
-            .filter(Boolean)
-    );
+    const values = envValue
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean);
+
+    return values.length > 0 ? new Set(values) : null;
 };
 
-const PUBLIC_LAUNCH_OPENROUTER_MODELS = [
-    'arcee-ai/trinity-large-preview:free',
-    'google/gemini-3-flash',
-];
-const PUBLIC_LAUNCH_OPENAI_MODELS = [];
-const PUBLIC_LAUNCH_GEMINI_MODELS = ['gemini-1.5-flash'];
-
-const OPENROUTER_ALLOWED_MODELS = parseModelAllowlist(
-    process.env.OPENROUTER_ALLOWED_MODELS,
-    PUBLIC_LAUNCH_OPENROUTER_MODELS
-);
-const OPENAI_ALLOWED_MODELS = parseModelAllowlist(
-    process.env.OPENAI_ALLOWED_MODELS,
-    PUBLIC_LAUNCH_OPENAI_MODELS
-);
-const GEMINI_ALLOWED_MODELS = parseModelAllowlist(
-    process.env.GEMINI_ALLOWED_MODELS,
-    PUBLIC_LAUNCH_GEMINI_MODELS
-);
-const TRACKED_ALLOWED_MODELS = new Set([
-    ...OPENROUTER_ALLOWED_MODELS,
-    ...OPENAI_ALLOWED_MODELS,
-    ...GEMINI_ALLOWED_MODELS,
-]);
+const OPENROUTER_ALLOWED_MODELS = parseModelAllowlist(process.env.OPENROUTER_ALLOWED_MODELS);
+const OPENAI_ALLOWED_MODELS = parseModelAllowlist(process.env.OPENAI_ALLOWED_MODELS);
+const GEMINI_ALLOWED_MODELS = parseModelAllowlist(process.env.GEMINI_ALLOWED_MODELS);
+const TRACKED_ALLOWED_MODELS = parseModelAllowlist(process.env.TRACKED_ALLOWED_MODELS);
 
 const normalizeModelId = (value) => typeof value === 'string' ? value.trim() : '';
 
@@ -213,8 +193,8 @@ const createModelAccessGuard = ({ allowedModels, bodyKey = 'model', defaultModel
             return res.status(400).json({ error: 'A model identifier is required.' });
         }
 
-        if (!allowedModels.has(requestedModel)) {
-            return res.status(403).json({ error: 'Requested model is not enabled for the public launch.' });
+        if (allowedModels && !allowedModels.has(requestedModel)) {
+            return res.status(403).json({ error: 'Requested model is not enabled for this server.' });
         }
 
         req.allowedModel = requestedModel;
@@ -780,8 +760,20 @@ app.post(
                 console.error('[USAGE] Failed to cancel usage_event:', cancelError.message);
             }
         }
-        console.error('OpenRouter Error:', error.response?.data || error.message);
-        res.status(error.response?.status || 500).json({ error: 'Failed to fetch from OpenRouter' });
+        const upstreamStatus = error.response?.status || 500;
+        const upstreamData = error.response?.data;
+
+        console.error('OpenRouter Error:', upstreamData || error.message);
+
+        if (upstreamData && typeof upstreamData === 'object' && !Buffer.isBuffer(upstreamData)) {
+            return res.status(upstreamStatus).json(upstreamData);
+        }
+
+        return res.status(upstreamStatus).json({
+            error: typeof upstreamData === 'string' && upstreamData
+                ? upstreamData
+                : error.message || 'Failed to fetch from OpenRouter',
+        });
     }
 });
 
